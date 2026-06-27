@@ -4,10 +4,36 @@
 #include <QThread>
 #include <QTreeView>
 #include <QSortFilterProxyModel>
+#include <QSet>
+#include <QMap>
 #include <util/source-profiler.h>
 #include <obs-frontend-api.h>
+#include <atomic>
+#include <mutex>
 
 class PerfTreeItem;
+
+/* Broad, stable (locale-independent) categorisation of a tree node, used to
+ * decide what gets broadcast over the websocket. */
+enum class SourceCategory { None, Scene, Group, Source, Filter, Transition };
+
+/* Category bitmask flags for the websocket "what to send" filter. */
+enum WSCategoryFlag {
+	WS_CAT_SCENE = 1 << 0,
+	WS_CAT_GROUP = 1 << 1,
+	WS_CAT_SOURCE = 1 << 2,
+	WS_CAT_FILTER = 1 << 3,
+	WS_CAT_TRANSITION = 1 << 4,
+	WS_CAT_ALL = WS_CAT_SCENE | WS_CAT_GROUP | WS_CAT_SOURCE | WS_CAT_FILTER | WS_CAT_TRANSITION,
+};
+
+/* Immutable snapshot of the broadcast filter, built once per emit so the hot
+ * path never locks per-node. */
+struct WSFilter {
+	unsigned categories = WS_CAT_ALL;
+	bool kindFilter = false; /* when true, only kinds in `kinds` are sent */
+	QSet<QString> kinds;     /* unversioned source ids, e.g. "browser_source" */
+};
 
 enum PerfTreeColumnType {
 	COLUMN_TYPE_DEFAULT,
@@ -99,6 +125,44 @@ public:
 
 	double targetFrameTime() const { return frameTime; }
 
+	/* ---- WebSocket broadcast settings (read on the updater thread, set from UI) ---- */
+	void setWsEnabled(bool e) { wsEnabled = e; }
+	bool getWsEnabled() const { return wsEnabled; }
+	void setWsInterval(int ms) { wsBroadcastInterval = (unsigned)(ms < 1 ? 1 : ms); }
+	int getWsInterval() const { return (int)wsBroadcastInterval.load(); }
+	void setWsCategories(unsigned c) { wsCategories = c; }
+	unsigned getWsCategories() const { return wsCategories.load(); }
+	void setWsKindFilter(bool on, const QSet<QString> &kinds)
+	{
+		std::lock_guard<std::mutex> lk(wsKindMutex);
+		wsKindFilter = on;
+		wsKinds = kinds;
+	}
+	bool getWsKindFilter() const
+	{
+		std::lock_guard<std::mutex> lk(wsKindMutex);
+		return wsKindFilter;
+	}
+	QSet<QString> getWsKinds() const
+	{
+		std::lock_guard<std::mutex> lk(wsKindMutex);
+		return wsKinds;
+	}
+	/* Register an input kind (id -> human display name) seen while building the
+	 * tree, so the UI can offer a checklist of the kinds actually present. */
+	void registerKind(const QString &id, const QString &display)
+	{
+		if (id.isEmpty())
+			return;
+		std::lock_guard<std::mutex> lk(wsKindMutex);
+		knownKinds.insert(id, display);
+	}
+	QMap<QString, QString> availableKinds() const
+	{
+		std::lock_guard<std::mutex> lk(wsKindMutex);
+		return knownKinds;
+	}
+
 	QList<int> getDefaultHiddenColumns();
 	void setGraphWidthFunc(std::function<int()> func) { graphWidthFunc = func; }
 
@@ -120,6 +184,16 @@ private:
 	bool refreshing = false;
 	double frameTime = 0.0;
 	unsigned int refreshInterval = 1000;
+
+	/* WebSocket broadcast state */
+	std::atomic<bool> wsEnabled{false};
+	std::atomic<unsigned> wsBroadcastInterval{1000};
+	std::atomic<unsigned> wsCategories{WS_CAT_ALL};
+	bool wsKindFilter = false;
+	QSet<QString> wsKinds;
+	QMap<QString, QString> knownKinds;
+	mutable std::mutex wsKindMutex;
+	uint64_t lastBroadcastNs = 0;
 
 	static bool EnumAll(void *data, obs_source_t *source);
 	static bool EnumNotPrivateSource(void *data, obs_source_t *source);
@@ -171,10 +245,14 @@ public:
 	QIcon getIcon(obs_source_t *source) const;
 	obs_source_t *getSource() const { return obs_weak_source_get_source(m_source); }
 
-	/* Serialize this item (and its children) into an obs_data tree for the
-	 * obs-websocket "SourceStats" broadcast. Caller owns the returned ref. */
-	obs_data_t *toData() const;
-	obs_data_array_t *childrenToArray() const;
+	/* Serialize this item's own stats (no children) into an obs_data object for
+	 * the obs-websocket broadcast. Caller owns the returned ref. */
+	obs_data_t *toDataSelf() const;
+	/* Whether this node should be broadcast given the active filter. */
+	bool passesFilter(const WSFilter &f) const;
+	/* Recursively append this item's children that pass `f` into `out`,
+	 * bubbling included descendants up through excluded levels. */
+	void collectBroadcast(const WSFilter &f, obs_data_array_t *out) const;
 
 private:
 	QList<PerfTreeItem *> m_childItems;
@@ -187,6 +265,8 @@ private:
 	QString name;
 	QString sourceDisplayName;
 	QString sourceType;
+	SourceCategory category = SourceCategory::None;
+	QString kindId; /* unversioned source id for inputs, e.g. "browser_source" */
 	bool async = false;
 	bool rendered = false;
 	bool active = false;

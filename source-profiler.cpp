@@ -14,9 +14,11 @@
 #include <QHeaderView>
 #include <QComboBox>
 #include <QMenu>
+#include <QStringList>
 #include <QStyledItemDelegate>
 #include <QPainter>
 #include <util/config-file.h>
+#include <util/platform.h>
 #include <obs-websocket-api.h>
 
 OBS_DECLARE_MODULE()
@@ -169,6 +171,99 @@ OBSPerfViewer::OBSPerfViewer(QWidget *parent) : QDialog(parent)
 
 	l->addLayout(searchBarLayout);
 
+	// ---- WebSocket broadcast controls ----
+	auto wsLayout = new QHBoxLayout();
+
+	auto wsEnable = new QCheckBox(QString::fromUtf8("Send over WebSocket"));
+	wsEnable->setToolTip(QString::fromUtf8("Broadcast these stats as obs-websocket \"source-profiler\" / "
+					      "\"SourceStats\" vendor events."));
+	wsLayout->addWidget(wsEnable);
+
+	auto wsContentBtn = new QPushButton(QString::fromUtf8("Content"));
+	wsContentBtn->setToolTip(QString::fromUtf8("Choose which kinds of items are sent over the websocket."));
+	auto wsMenu = new QMenu(this);
+	auto sceneA = wsMenu->addAction(QString::fromUtf8("Scenes"));
+	auto groupA = wsMenu->addAction(QString::fromUtf8("Groups"));
+	auto sourceA = wsMenu->addAction(QString::fromUtf8("Sources"));
+	auto filterA = wsMenu->addAction(QString::fromUtf8("Filters"));
+	auto transA = wsMenu->addAction(QString::fromUtf8("Transitions"));
+	for (auto a : {sceneA, groupA, sourceA, filterA, transA})
+		a->setCheckable(true);
+
+	auto applyCats = [this, sceneA, groupA, sourceA, filterA, transA]() {
+		unsigned c = 0;
+		if (sceneA->isChecked())
+			c |= WS_CAT_SCENE;
+		if (groupA->isChecked())
+			c |= WS_CAT_GROUP;
+		if (sourceA->isChecked())
+			c |= WS_CAT_SOURCE;
+		if (filterA->isChecked())
+			c |= WS_CAT_FILTER;
+		if (transA->isChecked())
+			c |= WS_CAT_TRANSITION;
+		model->setWsCategories(c);
+	};
+	for (auto a : {sceneA, groupA, sourceA, filterA, transA})
+		connect(a, &QAction::triggered, this, [applyCats]() { applyCats(); });
+
+	wsMenu->addSeparator();
+	auto kindsMenu = wsMenu->addMenu(QString::fromUtf8("Source types"));
+	// Populated lazily so it always reflects the kinds currently present.
+	connect(kindsMenu, &QMenu::aboutToShow, this, [this, kindsMenu]() {
+		kindsMenu->clear();
+		auto allA = kindsMenu->addAction(QString::fromUtf8("All types"));
+		allA->setCheckable(true);
+		allA->setChecked(!model->getWsKindFilter());
+		connect(allA, &QAction::triggered, this, [this]() { model->setWsKindFilter(false, {}); });
+		kindsMenu->addSeparator();
+
+		auto kinds = model->availableKinds();
+		if (kinds.isEmpty()) {
+			auto none = kindsMenu->addAction(QString::fromUtf8("(no sources seen yet)"));
+			none->setEnabled(false);
+			return;
+		}
+		auto selected = model->getWsKinds();
+		bool kf = model->getWsKindFilter();
+		for (auto it = kinds.constBegin(); it != kinds.constEnd(); ++it) {
+			const QString id = it.key();
+			auto a = kindsMenu->addAction(it.value().isEmpty() ? id : it.value());
+			a->setCheckable(true);
+			a->setChecked(kf && selected.contains(id));
+			connect(a, &QAction::triggered, this, [this, id](bool on) {
+				auto s = model->getWsKinds();
+				if (on)
+					s.insert(id);
+				else
+					s.remove(id);
+				model->setWsKindFilter(true, s);
+			});
+		}
+	});
+	wsContentBtn->setMenu(wsMenu);
+	wsLayout->addWidget(wsContentBtn);
+
+	wsLayout->addSpacerItem(new QSpacerItem(20, 20, QSizePolicy::Expanding));
+
+	auto wsIntervalLabel = new QLabel(QString::fromUtf8("Send every"));
+	wsLayout->addWidget(wsIntervalLabel);
+	auto wsIntervalSpin = new QSpinBox();
+	wsIntervalSpin->setSuffix(" ms");
+	wsIntervalSpin->setMinimum(100);
+	wsIntervalSpin->setMaximum(60000);
+	wsIntervalSpin->setSingleStep(100);
+	wsIntervalSpin->setValue(1000);
+	wsIntervalSpin->setToolTip(QString::fromUtf8("How often stats are sent. Cannot be faster than the refresh "
+						     "interval below."));
+	wsIntervalLabel->setBuddy(wsIntervalSpin);
+	wsLayout->addWidget(wsIntervalSpin);
+
+	l->addLayout(wsLayout);
+
+	connect(wsEnable, &QCheckBox::toggled, this, [this](bool on) { model->setWsEnabled(on); });
+	connect(wsIntervalSpin, &QSpinBox::valueChanged, model, &PerfTreeModel::setWsInterval);
+
 	l->addWidget(treeView);
 
 	auto buttonLayout = new QHBoxLayout();
@@ -253,6 +348,33 @@ OBSPerfViewer::OBSPerfViewer(QWidget *parent) : QDialog(parent)
 		treeView->header()->restoreState(ba);
 	}
 
+	// ---- Restore WebSocket broadcast settings ----
+	config_set_default_bool(obs_config, "PerfViewer", "ws_enabled", false);
+	config_set_default_int(obs_config, "PerfViewer", "ws_interval", 1000);
+	config_set_default_int(obs_config, "PerfViewer", "ws_categories", WS_CAT_ALL);
+	bool ws_enabled = config_get_bool(obs_config, "PerfViewer", "ws_enabled");
+	int ws_interval = (int)config_get_int(obs_config, "PerfViewer", "ws_interval");
+	unsigned ws_categories = (unsigned)config_get_int(obs_config, "PerfViewer", "ws_categories");
+	const char *ws_kinds = config_get_string(obs_config, "PerfViewer", "ws_kinds");
+
+	model->setWsInterval(ws_interval);
+	model->setWsCategories(ws_categories);
+	if (ws_kinds && *ws_kinds) {
+		QSet<QString> kindSet;
+		for (const auto &k : QString::fromUtf8(ws_kinds).split(',', Qt::SkipEmptyParts))
+			kindSet.insert(k);
+		model->setWsKindFilter(true, kindSet);
+	}
+	model->setWsEnabled(ws_enabled);
+
+	wsEnable->setChecked(ws_enabled);
+	wsIntervalSpin->setValue(ws_interval);
+	sceneA->setChecked(ws_categories & WS_CAT_SCENE);
+	groupA->setChecked(ws_categories & WS_CAT_GROUP);
+	sourceA->setChecked(ws_categories & WS_CAT_SOURCE);
+	filterA->setChecked(ws_categories & WS_CAT_FILTER);
+	transA->setChecked(ws_categories & WS_CAT_TRANSITION);
+
 	show();
 }
 
@@ -265,6 +387,11 @@ OBSPerfViewer::~OBSPerfViewer()
 		config_set_string(obs_config, "PerfViewer", "geometry", saveGeometry().toBase64().constData());
 		config_set_int(obs_config, "PerfViewer", "showmode", model->getShowMode());
 		config_set_bool(obs_config, "PerfViewer", "active", model->getActiveOnly());
+		config_set_bool(obs_config, "PerfViewer", "ws_enabled", model->getWsEnabled());
+		config_set_int(obs_config, "PerfViewer", "ws_interval", model->getWsInterval());
+		config_set_int(obs_config, "PerfViewer", "ws_categories", model->getWsCategories());
+		QStringList kinds = model->getWsKindFilter() ? QStringList(model->getWsKinds().values()) : QStringList();
+		config_set_string(obs_config, "PerfViewer", "ws_kinds", kinds.join(QChar(',')).toUtf8().constData());
 		config_save(obs_config);
 	}
 #ifndef __APPLE__
@@ -745,16 +872,32 @@ void PerfTreeModel::updateData()
 	if (rootItem)
 		rootItem->update();
 
-	/* Broadcast the freshly-updated stats tree to obs-websocket clients.
-	 * No-op when obs-websocket is absent (ws_vendor is null). */
-	if (ws_vendor && rootItem) {
-		obs_data_t *payload = obs_data_create();
-		obs_data_array_t *sources = rootItem->childrenToArray();
-		obs_data_set_array(payload, "sources", sources);
-		obs_data_set_double(payload, "frameTime", frameTime);
-		obs_websocket_vendor_emit_event(ws_vendor, "SourceStats", payload);
-		obs_data_array_release(sources);
-		obs_data_release(payload);
+	/* Broadcast the freshly-updated stats to obs-websocket clients, honouring
+	 * the user's enable toggle, send interval, and content filter. No-op when
+	 * obs-websocket is absent (ws_vendor is null) or broadcasting is disabled. */
+	if (ws_vendor && rootItem && wsEnabled.load()) {
+		uint64_t now = os_gettime_ns();
+		uint64_t intervalNs = (uint64_t)wsBroadcastInterval.load() * 1000000ULL;
+		if (now - lastBroadcastNs >= intervalNs) {
+			lastBroadcastNs = now;
+
+			WSFilter filter;
+			filter.categories = wsCategories.load();
+			{
+				std::lock_guard<std::mutex> lk(wsKindMutex);
+				filter.kindFilter = wsKindFilter;
+				filter.kinds = wsKinds;
+			}
+
+			obs_data_t *payload = obs_data_create();
+			obs_data_array_t *sources = obs_data_array_create();
+			rootItem->collectBroadcast(filter, sources);
+			obs_data_set_array(payload, "sources", sources);
+			obs_data_set_double(payload, "frameTime", frameTime);
+			obs_websocket_vendor_emit_event(ws_vendor, "SourceStats", payload);
+			obs_data_array_release(sources);
+			obs_data_release(payload);
+		}
 	}
 }
 
@@ -1208,18 +1351,26 @@ PerfTreeItem::PerfTreeItem(obs_source_t *source, PerfTreeItem *parent, PerfTreeM
 		switch (obs_source_get_type(source)) {
 		case OBS_SOURCE_TYPE_INPUT:
 			sourceType = QString::fromUtf8(obs_frontend_get_locale_string("Basic.Main.Source"));
+			category = SourceCategory::Source;
+			kindId = QString::fromUtf8(obs_source_get_unversioned_id(source));
+			if (m_model)
+				m_model->registerKind(kindId, sourceDisplayName);
 			break;
 		case OBS_SOURCE_TYPE_FILTER:
 			sourceType = QString::fromUtf8(obs_frontend_get_locale_string("Basic.Filters"));
+			category = SourceCategory::Filter;
 			break;
 		case OBS_SOURCE_TYPE_TRANSITION:
 			sourceType = QString::fromUtf8(obs_frontend_get_locale_string("Transition"));
+			category = SourceCategory::Transition;
 			break;
 		case OBS_SOURCE_TYPE_SCENE:
 			if (obs_source_is_group(source)) {
 				sourceType = QString::fromUtf8(obs_frontend_get_locale_string("Group"));
+				category = SourceCategory::Group;
 			} else {
 				sourceType = QString::fromUtf8(obs_frontend_get_locale_string("Basic.Scene"));
+				category = SourceCategory::Scene;
 			}
 			break;
 		}
@@ -1443,24 +1594,80 @@ void PerfTreeItem::update()
 	}
 }
 
-obs_data_array_t *PerfTreeItem::childrenToArray() const
+static const char *category_key(SourceCategory c)
 {
-	obs_data_array_t *arr = obs_data_array_create();
-	for (auto item : m_childItems) {
-		obs_data_t *child = item->toData();
-		obs_data_array_push_back(arr, child);
-		obs_data_release(child);
+	switch (c) {
+	case SourceCategory::Scene:
+		return "scene";
+	case SourceCategory::Group:
+		return "group";
+	case SourceCategory::Source:
+		return "source";
+	case SourceCategory::Filter:
+		return "filter";
+	case SourceCategory::Transition:
+		return "transition";
+	default:
+		return "";
 	}
-	return arr;
 }
 
-obs_data_t *PerfTreeItem::toData() const
+static unsigned category_bit(SourceCategory c)
+{
+	switch (c) {
+	case SourceCategory::Scene:
+		return WS_CAT_SCENE;
+	case SourceCategory::Group:
+		return WS_CAT_GROUP;
+	case SourceCategory::Source:
+		return WS_CAT_SOURCE;
+	case SourceCategory::Filter:
+		return WS_CAT_FILTER;
+	case SourceCategory::Transition:
+		return WS_CAT_TRANSITION;
+	default:
+		return 0;
+	}
+}
+
+bool PerfTreeItem::passesFilter(const WSFilter &f) const
+{
+	unsigned bit = category_bit(category);
+	if (!bit || !(f.categories & bit))
+		return false;
+	if (category == SourceCategory::Source && f.kindFilter && !f.kinds.contains(kindId))
+		return false;
+	return true;
+}
+
+void PerfTreeItem::collectBroadcast(const WSFilter &f, obs_data_array_t *out) const
+{
+	for (auto item : m_childItems) {
+		if (item->passesFilter(f)) {
+			obs_data_t *node = item->toDataSelf();
+			obs_data_array_t *kids = obs_data_array_create();
+			item->collectBroadcast(f, kids);
+			obs_data_set_array(node, "children", kids);
+			obs_data_array_release(kids);
+			obs_data_array_push_back(out, node);
+			obs_data_release(node);
+		} else {
+			/* Excluded: bubble any included descendants up to this level. */
+			item->collectBroadcast(f, out);
+		}
+	}
+}
+
+obs_data_t *PerfTreeItem::toDataSelf() const
 {
 	obs_data_t *d = obs_data_create();
 
 	obs_data_set_string(d, "name", name.toUtf8().constData());
 	obs_data_set_string(d, "sourceType", sourceType.toUtf8().constData());
 	obs_data_set_string(d, "displayName", sourceDisplayName.toUtf8().constData());
+	obs_data_set_string(d, "category", category_key(category));
+	if (!kindId.isEmpty())
+		obs_data_set_string(d, "kindId", kindId.toUtf8().constData());
 
 	obs_source_t *source = getSource();
 	if (source) {
@@ -1514,10 +1721,6 @@ obs_data_t *PerfTreeItem::toData() const
 			obs_data_set_double(d, "asyncRenderedWorst", ns_to_ms(m_perf->async_rendered_worst));
 		}
 	}
-
-	obs_data_array_t *children = childrenToArray();
-	obs_data_set_array(d, "children", children);
-	obs_data_array_release(children);
 
 	return d;
 }
