@@ -17,6 +17,7 @@
 #include <QStyledItemDelegate>
 #include <QPainter>
 #include <util/config-file.h>
+#include <obs-websocket-api.h>
 
 OBS_DECLARE_MODULE()
 OBS_MODULE_AUTHOR("Exeldro");
@@ -24,6 +25,10 @@ OBS_MODULE_AUTHOR("Exeldro");
 OBS_MODULE_USE_DEFAULT_LOCALE("source-profiler", "en-US")
 
 static OBSPerfViewer *perf_viewer = nullptr;
+
+/* obs-websocket vendor handle used to broadcast profiler stats. Null when
+ * obs-websocket is not present; all emit sites guard on it. */
+static obs_websocket_vendor ws_vendor = nullptr;
 
 bool obs_module_load(void)
 {
@@ -48,6 +53,18 @@ void obs_module_unload()
 		delete perf_viewer;
 		perf_viewer = nullptr;
 	}
+}
+
+void obs_module_post_load(void)
+{
+	/* Must run here (not obs_module_load) so obs-websocket is guaranteed
+	 * loaded. Registers a vendor so the plugin can emit "SourceStats"
+	 * events to any connected obs-websocket client. */
+	ws_vendor = obs_websocket_register_vendor("source-profiler");
+	if (!ws_vendor)
+		blog(LOG_WARNING, "[Source Profiler] obs-websocket not found; stats broadcast disabled");
+	else
+		blog(LOG_INFO, "[Source Profiler] obs-websocket vendor registered; broadcasting stats");
 }
 
 class GraphDelegate : public QStyledItemDelegate {
@@ -727,6 +744,18 @@ void PerfTreeModel::updateData()
 
 	if (rootItem)
 		rootItem->update();
+
+	/* Broadcast the freshly-updated stats tree to obs-websocket clients.
+	 * No-op when obs-websocket is absent (ws_vendor is null). */
+	if (ws_vendor && rootItem) {
+		obs_data_t *payload = obs_data_create();
+		obs_data_array_t *sources = rootItem->childrenToArray();
+		obs_data_set_array(payload, "sources", sources);
+		obs_data_set_double(payload, "frameTime", frameTime);
+		obs_websocket_vendor_emit_event(ws_vendor, "SourceStats", payload);
+		obs_data_array_release(sources);
+		obs_data_release(payload);
+	}
 }
 
 void PerfViewerProxyModel::setFilterText(const QString &filter)
@@ -1412,6 +1441,85 @@ void PerfTreeItem::update()
 			m_model->itemChanged(this);
 		}
 	}
+}
+
+obs_data_array_t *PerfTreeItem::childrenToArray() const
+{
+	obs_data_array_t *arr = obs_data_array_create();
+	for (auto item : m_childItems) {
+		obs_data_t *child = item->toData();
+		obs_data_array_push_back(arr, child);
+		obs_data_release(child);
+	}
+	return arr;
+}
+
+obs_data_t *PerfTreeItem::toData() const
+{
+	obs_data_t *d = obs_data_create();
+
+	obs_data_set_string(d, "name", name.toUtf8().constData());
+	obs_data_set_string(d, "sourceType", sourceType.toUtf8().constData());
+	obs_data_set_string(d, "displayName", sourceDisplayName.toUtf8().constData());
+
+	obs_source_t *source = getSource();
+	if (source) {
+		const char *uuid = obs_source_get_uuid(source);
+		if (uuid)
+			obs_data_set_string(d, "uuid", uuid);
+		obs_data_set_int(d, "width", obs_source_get_width(source));
+		obs_data_set_int(d, "height", obs_source_get_height(source));
+		obs_source_release(source);
+	}
+
+	obs_data_set_bool(d, "active", active);
+	obs_data_set_bool(d, "rendered", rendered);
+	obs_data_set_bool(d, "enabled", enabled);
+	obs_data_set_bool(d, "async", async);
+	obs_data_set_bool(d, "filter", is_filter);
+	obs_data_set_bool(d, "private", is_private);
+	obs_data_set_int(d, "childCount", child_count);
+
+	if (m_perf) {
+		const double frame_ns = (double)obs_get_frame_interval_ns();
+
+		obs_data_set_double(d, "tickAvg", ns_to_ms(m_perf->tick_avg));
+		obs_data_set_double(d, "tickMax", ns_to_ms(m_perf->tick_max));
+		obs_data_set_double(d, "renderAvg", ns_to_ms(m_perf->render_avg));
+		obs_data_set_double(d, "renderMax", ns_to_ms(m_perf->render_max));
+		obs_data_set_double(d, "renderTotal", ns_to_ms(m_perf->render_sum));
+		obs_data_set_double(d, "renderGpuAvg", ns_to_ms(m_perf->render_gpu_avg));
+		obs_data_set_double(d, "renderGpuMax", ns_to_ms(m_perf->render_gpu_max));
+		obs_data_set_double(d, "renderGpuTotal", ns_to_ms(m_perf->render_gpu_sum));
+		obs_data_set_double(d, "total",
+				    ns_to_ms(m_perf->tick_avg + m_perf->render_sum + m_perf->render_gpu_sum));
+
+		/* Percentages computed exactly like the dock's columns so the
+		 * webpage matches the UI. */
+		if (frame_ns > 0.0) {
+			obs_data_set_double(d, "cpuPercentage",
+					    (double)(m_perf->render_sum + m_perf->tick_avg) / frame_ns * 100.0);
+			obs_data_set_double(d, "gpuPercentage", (double)m_perf->render_gpu_sum / frame_ns * 100.0);
+			obs_data_set_double(d, "totalPercentage",
+					    (double)(m_perf->tick_avg + m_perf->render_sum + m_perf->render_gpu_sum) /
+						    frame_ns * 100.0);
+		}
+
+		if (async) {
+			obs_data_set_double(d, "asyncInputFps", m_perf->async_input);
+			obs_data_set_double(d, "asyncRenderedFps", m_perf->async_rendered);
+			obs_data_set_double(d, "asyncInputBest", ns_to_ms(m_perf->async_input_best));
+			obs_data_set_double(d, "asyncInputWorst", ns_to_ms(m_perf->async_input_worst));
+			obs_data_set_double(d, "asyncRenderedBest", ns_to_ms(m_perf->async_rendered_best));
+			obs_data_set_double(d, "asyncRenderedWorst", ns_to_ms(m_perf->async_rendered_worst));
+		}
+	}
+
+	obs_data_array_t *children = childrenToArray();
+	obs_data_set_array(d, "children", children);
+	obs_data_array_release(children);
+
+	return d;
 }
 
 QIcon PerfTreeItem::getIcon(obs_source_t *source) const

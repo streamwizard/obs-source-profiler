@@ -171,6 +171,11 @@ public:
 	QIcon getIcon(obs_source_t *source) const;
 	obs_source_t *getSource() const { return obs_weak_source_get_source(m_source); }
 
+	/* Serialize this item (and its children) into an obs_data tree for the
+	 * obs-websocket "SourceStats" broadcast. Caller owns the returned ref. */
+	obs_data_t *toData() const;
+	obs_data_array_t *childrenToArray() const;
+
 private:
 	QList<PerfTreeItem *> m_childItems;
 	PerfTreeItem *m_parentItem;
