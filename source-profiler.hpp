@@ -166,6 +166,11 @@ public:
 	QList<int> getDefaultHiddenColumns();
 	void setGraphWidthFunc(std::function<int()> func) { graphWidthFunc = func; }
 
+	/* When true this model owns the obs-websocket broadcast. The headless
+	 * background instance sets this; the dock's view model leaves it false so
+	 * only one instance ever emits. */
+	void setBroadcaster(bool b) { m_broadcaster = b; }
+
 public slots:
 	void refreshSources();
 
@@ -177,7 +182,10 @@ private:
 	QList<PerfTreeColumn> columns;
 	std::unique_ptr<QThread> updater;
 	bool updaterRunning;
-	std::function<int()> graphWidthFunc = nullptr;
+	bool m_broadcaster = false;
+	/* Defaults to a no-op so the headless broadcaster (which has no tree view)
+	 * never calls a null function during update(). The dock overrides it. */
+	std::function<int()> graphWidthFunc = []() { return 0; };
 
 	enum ShowMode showMode = ShowMode::SCENE;
 	bool activeOnly = true;

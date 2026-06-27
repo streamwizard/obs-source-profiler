@@ -32,6 +32,142 @@ static OBSPerfViewer *perf_viewer = nullptr;
  * obs-websocket is not present; all emit sites guard on it. */
 static obs_websocket_vendor ws_vendor = nullptr;
 
+/* The profiler is a global on/off in libobs, but several things may want it on
+ * at once (the dock and the background broadcaster). Refcount so it stays on
+ * until the last user releases it. */
+static int profiler_refs = 0;
+static void profiler_acquire()
+{
+	if (profiler_refs++ == 0) {
+		source_profiler_enable(true);
+#ifndef __APPLE__
+		source_profiler_gpu_enable(true);
+#endif
+	}
+}
+static void profiler_release()
+{
+	if (profiler_refs > 0 && --profiler_refs == 0) {
+#ifndef __APPLE__
+		source_profiler_gpu_enable(false);
+#endif
+		source_profiler_enable(false);
+	}
+}
+
+/* Headless background broadcaster. Exists whenever broadcasting is enabled,
+ * independent of whether the dock window is open. It always enumerates ALL
+ * sources so the websocket content is decoupled from the dock's view. */
+static PerfTreeModel *broadcaster = nullptr;
+
+/* Session copy of the websocket settings, persisted to the OBS user config so
+ * they survive even when the broadcaster object does not exist. */
+static struct {
+	bool enabled = false;
+	int interval = 1000;
+	unsigned categories = WS_CAT_ALL;
+	bool kindFilter = false;
+	QSet<QString> kinds;
+} g_ws;
+
+static void ws_save()
+{
+	auto cfg = obs_frontend_get_user_config();
+	if (!cfg)
+		return;
+	config_set_bool(cfg, "PerfViewer", "ws_enabled", g_ws.enabled);
+	config_set_int(cfg, "PerfViewer", "ws_interval", g_ws.interval);
+	config_set_int(cfg, "PerfViewer", "ws_categories", g_ws.categories);
+	QStringList kinds = g_ws.kindFilter ? QStringList(g_ws.kinds.values()) : QStringList();
+	config_set_string(cfg, "PerfViewer", "ws_kinds", kinds.join(QChar(',')).toUtf8().constData());
+	config_save(cfg);
+}
+
+static void ws_load()
+{
+	auto cfg = obs_frontend_get_user_config();
+	if (!cfg)
+		return;
+	config_set_default_bool(cfg, "PerfViewer", "ws_enabled", false);
+	config_set_default_int(cfg, "PerfViewer", "ws_interval", 1000);
+	config_set_default_int(cfg, "PerfViewer", "ws_categories", WS_CAT_ALL);
+	g_ws.enabled = config_get_bool(cfg, "PerfViewer", "ws_enabled");
+	g_ws.interval = (int)config_get_int(cfg, "PerfViewer", "ws_interval");
+	g_ws.categories = (unsigned)config_get_int(cfg, "PerfViewer", "ws_categories");
+	g_ws.kinds.clear();
+	g_ws.kindFilter = false;
+	const char *k = config_get_string(cfg, "PerfViewer", "ws_kinds");
+	if (k && *k) {
+		for (const auto &s : QString::fromUtf8(k).split(QChar(','), Qt::SkipEmptyParts))
+			g_ws.kinds.insert(s);
+		g_ws.kindFilter = true;
+	}
+}
+
+static void start_broadcaster()
+{
+	if (broadcaster || !ws_vendor)
+		return;
+	broadcaster = new PerfTreeModel(nullptr);
+	broadcaster->setBroadcaster(true);
+	broadcaster->setWsEnabled(true);
+	broadcaster->setWsInterval(g_ws.interval);
+	broadcaster->setWsCategories(g_ws.categories);
+	broadcaster->setWsKindFilter(g_ws.kindFilter, g_ws.kinds);
+	/* Everything, active or not, so the filter has the full pool to draw from. */
+	broadcaster->setActiveOnly(false, false);
+	broadcaster->setShowMode(PerfTreeModel::ShowMode::ALL);
+}
+
+static void stop_broadcaster()
+{
+	if (!broadcaster)
+		return;
+	delete broadcaster;
+	broadcaster = nullptr;
+}
+
+static void ws_set_enabled(bool on)
+{
+	g_ws.enabled = on;
+	ws_save();
+	if (on)
+		start_broadcaster();
+	else
+		stop_broadcaster();
+}
+static void ws_set_interval(int v)
+{
+	g_ws.interval = v;
+	ws_save();
+	if (broadcaster)
+		broadcaster->setWsInterval(v);
+}
+static void ws_set_categories(unsigned c)
+{
+	g_ws.categories = c;
+	ws_save();
+	if (broadcaster)
+		broadcaster->setWsCategories(c);
+}
+static void ws_set_kind_filter(bool on, const QSet<QString> &kinds)
+{
+	g_ws.kindFilter = on;
+	g_ws.kinds = kinds;
+	ws_save();
+	if (broadcaster)
+		broadcaster->setWsKindFilter(on, kinds);
+}
+/* Kinds known to the running broadcaster, falling back to the dock's model. */
+static QMap<QString, QString> ws_available_kinds(PerfTreeModel *dockModel)
+{
+	if (broadcaster)
+		return broadcaster->availableKinds();
+	if (dockModel)
+		return dockModel->availableKinds();
+	return {};
+}
+
 bool obs_module_load(void)
 {
 	blog(LOG_INFO, "[Source Profiler] loaded version %s", PROJECT_VERSION);
@@ -55,6 +191,7 @@ void obs_module_unload()
 		delete perf_viewer;
 		perf_viewer = nullptr;
 	}
+	stop_broadcaster();
 }
 
 void obs_module_post_load(void)
@@ -67,6 +204,12 @@ void obs_module_post_load(void)
 		blog(LOG_WARNING, "[Source Profiler] obs-websocket not found; stats broadcast disabled");
 	else
 		blog(LOG_INFO, "[Source Profiler] obs-websocket vendor registered; broadcasting stats");
+
+	/* Restore saved settings and, if broadcasting was left enabled, start the
+	 * background broadcaster now so it runs without the dock being opened. */
+	ws_load();
+	if (g_ws.enabled)
+		start_broadcaster();
 }
 
 class GraphDelegate : public QStyledItemDelegate {
@@ -190,7 +333,7 @@ OBSPerfViewer::OBSPerfViewer(QWidget *parent) : QDialog(parent)
 	for (auto a : {sceneA, groupA, sourceA, filterA, transA})
 		a->setCheckable(true);
 
-	auto applyCats = [this, sceneA, groupA, sourceA, filterA, transA]() {
+	auto applyCats = [sceneA, groupA, sourceA, filterA, transA]() {
 		unsigned c = 0;
 		if (sceneA->isChecked())
 			c |= WS_CAT_SCENE;
@@ -202,7 +345,7 @@ OBSPerfViewer::OBSPerfViewer(QWidget *parent) : QDialog(parent)
 			c |= WS_CAT_FILTER;
 		if (transA->isChecked())
 			c |= WS_CAT_TRANSITION;
-		model->setWsCategories(c);
+		ws_set_categories(c);
 	};
 	for (auto a : {sceneA, groupA, sourceA, filterA, transA})
 		connect(a, &QAction::triggered, this, [applyCats]() { applyCats(); });
@@ -214,30 +357,28 @@ OBSPerfViewer::OBSPerfViewer(QWidget *parent) : QDialog(parent)
 		kindsMenu->clear();
 		auto allA = kindsMenu->addAction(QString::fromUtf8("All types"));
 		allA->setCheckable(true);
-		allA->setChecked(!model->getWsKindFilter());
-		connect(allA, &QAction::triggered, this, [this]() { model->setWsKindFilter(false, {}); });
+		allA->setChecked(!g_ws.kindFilter);
+		connect(allA, &QAction::triggered, this, []() { ws_set_kind_filter(false, {}); });
 		kindsMenu->addSeparator();
 
-		auto kinds = model->availableKinds();
+		auto kinds = ws_available_kinds(model);
 		if (kinds.isEmpty()) {
 			auto none = kindsMenu->addAction(QString::fromUtf8("(no sources seen yet)"));
 			none->setEnabled(false);
 			return;
 		}
-		auto selected = model->getWsKinds();
-		bool kf = model->getWsKindFilter();
 		for (auto it = kinds.constBegin(); it != kinds.constEnd(); ++it) {
 			const QString id = it.key();
 			auto a = kindsMenu->addAction(it.value().isEmpty() ? id : it.value());
 			a->setCheckable(true);
-			a->setChecked(kf && selected.contains(id));
-			connect(a, &QAction::triggered, this, [this, id](bool on) {
-				auto s = model->getWsKinds();
+			a->setChecked(g_ws.kindFilter && g_ws.kinds.contains(id));
+			connect(a, &QAction::triggered, this, [id](bool on) {
+				QSet<QString> s = g_ws.kinds;
 				if (on)
 					s.insert(id);
 				else
 					s.remove(id);
-				model->setWsKindFilter(true, s);
+				ws_set_kind_filter(true, s);
 			});
 		}
 	});
@@ -261,8 +402,8 @@ OBSPerfViewer::OBSPerfViewer(QWidget *parent) : QDialog(parent)
 
 	l->addLayout(wsLayout);
 
-	connect(wsEnable, &QCheckBox::toggled, this, [this](bool on) { model->setWsEnabled(on); });
-	connect(wsIntervalSpin, &QSpinBox::valueChanged, model, &PerfTreeModel::setWsInterval);
+	connect(wsEnable, &QCheckBox::toggled, this, [](bool on) { ws_set_enabled(on); });
+	connect(wsIntervalSpin, &QSpinBox::valueChanged, this, [](int v) { ws_set_interval(v); });
 
 	l->addWidget(treeView);
 
@@ -321,10 +462,8 @@ OBSPerfViewer::OBSPerfViewer(QWidget *parent) : QDialog(parent)
 	});
 	connect(refreshInterval, &QSpinBox::valueChanged, model, &PerfTreeModel::setRefreshInterval);
 
-	source_profiler_enable(true);
-#ifndef __APPLE__
-	source_profiler_gpu_enable(true);
-#endif
+	/* The profiler is enabled by the model (refcounted), so the dock no longer
+	 * toggles it directly. */
 
 	auto obs_config = obs_frontend_get_user_config();
 	auto show_mode = (int)config_get_int(obs_config, "PerfViewer", "showmode");
@@ -348,32 +487,16 @@ OBSPerfViewer::OBSPerfViewer(QWidget *parent) : QDialog(parent)
 		treeView->header()->restoreState(ba);
 	}
 
-	// ---- Restore WebSocket broadcast settings ----
-	config_set_default_bool(obs_config, "PerfViewer", "ws_enabled", false);
-	config_set_default_int(obs_config, "PerfViewer", "ws_interval", 1000);
-	config_set_default_int(obs_config, "PerfViewer", "ws_categories", WS_CAT_ALL);
-	bool ws_enabled = config_get_bool(obs_config, "PerfViewer", "ws_enabled");
-	int ws_interval = (int)config_get_int(obs_config, "PerfViewer", "ws_interval");
-	unsigned ws_categories = (unsigned)config_get_int(obs_config, "PerfViewer", "ws_categories");
-	const char *ws_kinds = config_get_string(obs_config, "PerfViewer", "ws_kinds");
-
-	model->setWsInterval(ws_interval);
-	model->setWsCategories(ws_categories);
-	if (ws_kinds && *ws_kinds) {
-		QSet<QString> kindSet;
-		for (const auto &k : QString::fromUtf8(ws_kinds).split(',', Qt::SkipEmptyParts))
-			kindSet.insert(k);
-		model->setWsKindFilter(true, kindSet);
-	}
-	model->setWsEnabled(ws_enabled);
-
-	wsEnable->setChecked(ws_enabled);
-	wsIntervalSpin->setValue(ws_interval);
-	sceneA->setChecked(ws_categories & WS_CAT_SCENE);
-	groupA->setChecked(ws_categories & WS_CAT_GROUP);
-	sourceA->setChecked(ws_categories & WS_CAT_SOURCE);
-	filterA->setChecked(ws_categories & WS_CAT_FILTER);
-	transA->setChecked(ws_categories & WS_CAT_TRANSITION);
+	// ---- Reflect the (already loaded) WebSocket broadcast settings into the UI ----
+	// g_ws is loaded once in obs_module_post_load and owned by the background
+	// broadcaster; here we just mirror it into the dock controls.
+	wsEnable->setChecked(g_ws.enabled);
+	wsIntervalSpin->setValue(g_ws.interval);
+	sceneA->setChecked(g_ws.categories & WS_CAT_SCENE);
+	groupA->setChecked(g_ws.categories & WS_CAT_GROUP);
+	sourceA->setChecked(g_ws.categories & WS_CAT_SOURCE);
+	filterA->setChecked(g_ws.categories & WS_CAT_FILTER);
+	transA->setChecked(g_ws.categories & WS_CAT_TRANSITION);
 
 	show();
 }
@@ -387,17 +510,10 @@ OBSPerfViewer::~OBSPerfViewer()
 		config_set_string(obs_config, "PerfViewer", "geometry", saveGeometry().toBase64().constData());
 		config_set_int(obs_config, "PerfViewer", "showmode", model->getShowMode());
 		config_set_bool(obs_config, "PerfViewer", "active", model->getActiveOnly());
-		config_set_bool(obs_config, "PerfViewer", "ws_enabled", model->getWsEnabled());
-		config_set_int(obs_config, "PerfViewer", "ws_interval", model->getWsInterval());
-		config_set_int(obs_config, "PerfViewer", "ws_categories", model->getWsCategories());
-		QStringList kinds = model->getWsKindFilter() ? QStringList(model->getWsKinds().values()) : QStringList();
-		config_set_string(obs_config, "PerfViewer", "ws_kinds", kinds.join(QChar(',')).toUtf8().constData());
 		config_save(obs_config);
+		/* WebSocket settings are owned by the background broadcaster and saved
+		 * via ws_save() whenever they change. */
 	}
-#ifndef __APPLE__
-	source_profiler_gpu_enable(false);
-#endif
-	source_profiler_enable(false);
 	delete model;
 }
 
@@ -417,6 +533,10 @@ static double ns_to_ms(uint64_t ns)
 
 PerfTreeModel::PerfTreeModel(QObject *parent) : QAbstractItemModel(parent)
 {
+	/* Keep the profiler running for as long as any model (dock or broadcaster)
+	 * is alive. */
+	profiler_acquire();
+
 	columns = {
 		PerfTreeColumn(QString::fromUtf8(obs_module_text("PerfViewer.Name")),
 			       [](const PerfTreeItem *item) { return QVariant(item->name); }),
@@ -875,7 +995,7 @@ void PerfTreeModel::updateData()
 	/* Broadcast the freshly-updated stats to obs-websocket clients, honouring
 	 * the user's enable toggle, send interval, and content filter. No-op when
 	 * obs-websocket is absent (ws_vendor is null) or broadcasting is disabled. */
-	if (ws_vendor && rootItem && wsEnabled.load()) {
+	if (m_broadcaster && ws_vendor && rootItem && wsEnabled.load()) {
 		uint64_t now = os_gettime_ns();
 		uint64_t intervalNs = (uint64_t)wsBroadcastInterval.load() * 1000000ULL;
 		if (now - lastBroadcastNs >= intervalNs) {
@@ -935,6 +1055,8 @@ PerfTreeModel::~PerfTreeModel()
 	signal_handler_disconnect(sh, "source_deactivate", source_deactivate, this);
 
 	delete rootItem;
+
+	profiler_release();
 }
 
 QVariant ColorFormPercentage(double percentage)
